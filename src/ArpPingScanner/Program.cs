@@ -14,14 +14,15 @@ using System.Net.Sockets;
 using System.Text.RegularExpressions;
 
 // コマンドライン引数を定義します。
-var cidrArgument = new Argument<string>(
-    name: "cidr",
-    description: "スキャン対象のCIDR (例: 192.168.10.0/24)",
-    getDefaultValue: () => "192.168.10.0/24");
-var outputOption = new Option<string?>(
-    name: "--output",
-    description: "出力先CSVファイルパス (省略可能)");
-outputOption.AddAlias("-o");
+var cidrArgument = new Argument<string>("cidr")
+{
+    Description = "スキャン対象のCIDR (例: 192.168.10.0/24)",
+    DefaultValueFactory = _ => "192.168.10.0/24",
+};
+var outputOption = new Option<string?>("--output", "-o")
+{
+    Description = "出力先CSVファイルパス (省略可能)",
+};
 
 // ルートコマンドを作成します。
 var rootCommand = new RootCommand(description: "指定したCIDR範囲のネットワークスキャンを実行し、結果を表示またはCSVに出力します。")
@@ -31,51 +32,52 @@ var rootCommand = new RootCommand(description: "指定したCIDR範囲のネッ�
 };
 
 // コマンドのハンドラーを設定します。
-rootCommand.SetHandler(
-    async (cidr, output) =>
+rootCommand.Arguments.Add(cidrArgument);
+rootCommand.Options.Add(outputOption);
+rootCommand.SetAction(async parseResult =>
+{
+    var cidr = parseResult.GetValue(cidrArgument);
+    var output = parseResult.GetValue(outputOption);
+    var ipList = GetIpRange(cidr).ToList();
+
+    var startTime = DateTimeOffset.Now;
+    Console.WriteLine($"[{startTime:HH:mm:ss}] Start Scanning network [{cidr}]...");
+
+    // 並列実行数を制限して結果を収集します。
+    var maxDegreeOfParallelism = 100; // 同時実行タスク数の上限
+    using var semaphore = new SemaphoreSlim(maxDegreeOfParallelism);
+    var results = await ProcessScanningAsync(semaphore, ipList).ConfigureAwait(false);
+
+    var finishTime = DateTimeOffset.Now;
+    Console.WriteLine(
+        $"[{finishTime:HH:mm:ss}] Completed Scanning network [{cidr}]... {(finishTime - startTime).TotalMilliseconds:n0}[ms]");
+    Console.WriteLine();
+
+    // 到達可能なホストのみを抽出します。
+    var filteredResults = results.Where(result => result.IsReachable).ToArray();
+
+    // 結果をコンソールへ出力します。
+    foreach (var result in filteredResults)
     {
-        var ipList = GetIpRange(cidr).ToList();
-
-        var startTime = DateTimeOffset.Now;
-        Console.WriteLine($"[{startTime:HH:mm:ss}] Start Scanning network [{cidr}]...");
-
-        // 並列実行数を制限して結果を収集します。
-        var maxDegreeOfParallelism = 100; // 同時実行タスク数の上限
-        using var semaphore = new SemaphoreSlim(maxDegreeOfParallelism);
-        var results = await ProcessScanningAsync(semaphore, ipList).ConfigureAwait(false);
-
-        var finishTime = DateTimeOffset.Now;
         Console.WriteLine(
-            $"[{finishTime:HH:mm:ss}] Completed Scanning network [{cidr}]... {(finishTime - startTime).TotalMilliseconds:n0}[ms]");
-        Console.WriteLine();
+            $"{result.Ip,-15}\t{result.HostName,-30}\t{result.MacAddress,-20}\t{(result.IsReachable ? "Reachable" : "Unreachable")}");
+    }
 
-        // 到達可能なホストのみを抽出します。
-        var filteredResults = results.Where(result => result.IsReachable).ToArray();
+    // 結果をCSVに出力する場合
+    if (!string.IsNullOrEmpty(output))
+    {
+        var csvLines = filteredResults
+            .Select(
+                result =>
+                    $"{result.Ip},{result.HostName},{result.MacAddress},{result.IsReachable}");
+        await File.WriteAllLinesAsync(output, csvLines).ConfigureAwait(false);
 
-        // 結果をコンソールへ出力します。
-        foreach (var result in filteredResults)
-        {
-            Console.WriteLine(
-                $"{result.Ip,-15}\t{result.HostName,-30}\t{result.MacAddress,-20}\t{(result.IsReachable ? "Reachable" : "Unreachable")}");
-        }
-
-        // 結果をCSVに出力する場合
-        if (!string.IsNullOrEmpty(output))
-        {
-            var csvLines = filteredResults
-                .Select(
-                    result =>
-                        $"{result.Ip},{result.HostName},{result.MacAddress},{result.IsReachable}");
-            await File.WriteAllLinesAsync(output, csvLines).ConfigureAwait(false);
-
-            Console.WriteLine($"結果をCSVファイルに出力しました: {output}");
-        }
-    },
-    cidrArgument,
-    outputOption);
+        Console.WriteLine($"結果をCSVファイルに出力しました: {output}");
+    }
+});
 
 // コマンドを実行
-return await rootCommand.InvokeAsync(args).ConfigureAwait(false);
+return rootCommand.Parse(args).Invoke();
 
 async Task<List<HostInfo>> ProcessScanningAsync(
     SemaphoreSlim parallelismLimiter,
